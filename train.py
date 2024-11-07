@@ -47,6 +47,8 @@ from ptp_utils import AttentionStore, compute_score, emd_distance_2d, get_connec
 from diffusers.models.cross_attention import CrossAttention
 import torchvision.transforms as T
 from clustering.finch import FINCH
+from clustering.dbscan import DBscan
+from clustering.spectral_cluster import SpectralCluster
 from scipy.optimize import linear_sum_assignment as linear_assignment 
 from infer import infer_with_embed
 from utils.loss import SupConLoss
@@ -60,10 +62,19 @@ logger = get_logger(__name__)
 def save_progress(text_encoder, placeholder_token, placeholder_token_id, accelerator, save_path):
     logger.info("Saving embeddings")
     learned_embeds_dict = {}
+    
+    learned_embeds_sum = 0
+    
     for i, ph_id in enumerate(placeholder_token_id):
         learned_embeds = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[ph_id]
         learned_embeds_dict[placeholder_token[i]] = learned_embeds.detach().cpu()
+        learned_embeds_sum += learned_embeds.detach().cpu()
+    
+    learned_embeds_avg = learned_embeds_sum/len(placeholder_token_id)    
+    learned_embeds_dict["asset_avg"] = learned_embeds_avg
+
     torch.save(learned_embeds_dict, save_path)
+    
     
     return learned_embeds_dict
 
@@ -77,11 +88,27 @@ def test_generation(args, placeholder_token, save_path, global_step, split_state
             os.mkdir(os.path.join(args.output_dir, 'images'))
             
         grid.save(os.path.join(args.output_dir, 'images/' + prompt.replace(' ', '-') + '-step-{}.png'.format(global_step)))
+        
+    tok = "asset_avg"
+    prompt = "A photo of {}".format(tok)
+
+    grid = infer_with_embed(save_path, args.pretrained_model_name_or_path, prompt, num_samples=args.num_samples, num_rows=args.num_rows)
+
+    if not os.path.exists(os.path.join(args.output_dir, 'images')):
+        os.mkdir(os.path.join(args.output_dir, 'images'))
+            
+    grid.save(os.path.join(args.output_dir, 'images/' + prompt.replace(' ', '-') + '-step-{}.png'.format(global_step)))
     
     if not split_state:
         full_prompt = "A photo of " + " and ".join(placeholder_token)
         grid = infer_with_embed(save_path, args.pretrained_model_name_or_path, full_prompt, num_samples=args.num_samples, num_rows=args.num_rows)
-            
+ 
+        grid.save(os.path.join(args.output_dir, 'images/' + full_prompt.replace(' ', '-') + '-step-{}.png'.format(global_step)))
+        
+    if not split_state:
+        full_prompt = "A photo of " + " and ".join(placeholder_token) + " and " + "asset_avg"
+        grid = infer_with_embed(save_path, args.pretrained_model_name_or_path, full_prompt, num_samples=args.num_samples, num_rows=args.num_rows)
+ 
         grid.save(os.path.join(args.output_dir, 'images/' + full_prompt.replace(' ', '-') + '-step-{}.png'.format(global_step)))
 
 def import_model_class_from_model_name_or_path(
@@ -808,11 +835,12 @@ class ConceptExpress:
 
         # Handle the repository creation
         if self.accelerator.is_main_process:
-            os.makedirs(self.args.output_dir, exist_ok=True)
-            
+            os.makedirs(self.args.output_dir, exist_ok=True) 
             with open(os.path.join(self.args.output_dir, 'args.json'), 'w') as f:
                 json.dump(self.args.__dict__, f, indent=2)
-
+                
+        print('self.accelerator:',self.accelerator)
+        print('self.args.output_dir',self.args.output_dir)
         # import correct text encoder class
         text_encoder_cls = import_model_class_from_model_name_or_path(
             self.args.pretrained_model_name_or_path, self.args.revision
@@ -1058,6 +1086,7 @@ class ConceptExpress:
         # We need to initialize the trackers we use, and also store our configuration.
         # The trackers initializes automatically on the main process.
         if self.accelerator.is_main_process:
+            vars(self.args).pop("initializer_tokens")
             self.accelerator.init_trackers("dreambooth", config=vars(self.args))
 
         # Train
@@ -1195,7 +1224,7 @@ class ConceptExpress:
                             padding="max_length",
                             max_length=self.tokenizer.model_max_length,
                             return_tensors="pt",
-                        ).input_ids
+                        ).input_ids.to(latents.device)
 
                         # Get the text embedding for conditioning
                         encoder_hidden_states = self.text_encoder(null_input_ids)[0]
@@ -1325,6 +1354,7 @@ class ConceptExpress:
                         )
 
                         # Get the text embedding for conditioning
+                        prompt_ids = prompt_ids.to(latents.device)
                         encoder_hidden_states = self.text_encoder(prompt_ids)[0]
                         # Predict the noise residual
                         model_pred = self.unet(
@@ -1444,6 +1474,7 @@ class ConceptExpress:
                             
                             sample_embeddings_normalized = F.normalize(sample_embeddings.unsqueeze(1), p=2, dim=-1)
                             
+                            # print(sample_embeddings_normalized.shape, label.shape)
                             loss_con = self.contrastive_loss(sample_embeddings_normalized, labels=label)
                             
                             loss += loss_con * self.args.weight_contrast
@@ -1649,6 +1680,7 @@ class ConceptExpress:
         out = out.sum(0) / out.shape[0]
         return out
 
+#############################################################
     def get_self_attention(self, eot_attn_mask, pil, global_step):
         pil = (pil * 0.5 + 0.5)
         out = []
@@ -1681,11 +1713,14 @@ class ConceptExpress:
         out = out.sum(0) / rw
         
         feat_map = out.reshape(64**2, 64**2)
-        mask_list, feat_list = self.cluster_attention(feat_map, eot_attn_mask, pil, global_step)
+        # mask_list, feat_list = self.cluster_attention(feat_map, eot_attn_mask, pil, global_step)
+        mask_list, feat_list = self.mask_feat_calculation(feat_map, eot_attn_mask, pil, global_step)
         
         # assert False, "EXIT!"
         return mask_list, feat_list
     
+    
+################################################
     def cluster_attention(self, feat_map, eot_attn_mask, pil, global_step): # (HW) * (HW)
         
         if not os.path.exists(os.path.join(self.args.output_dir, "attention/{}-step".format(global_step))):
@@ -1699,14 +1734,19 @@ class ConceptExpress:
         c, num_clust, req_c, min_sim_init = FINCH(x_np, initial_rank=None, 
                                     req_clust=None, distance='kld', 
                                     ensure_early_exit=False, verbose=True)
+        # c, num_clust, req_c, min_sim_init  = DBscan(x_np)
         
+       # c, num_clust, req_c, min_sim_init  = SpectralCluster(x_np)        
         for i, num in enumerate(num_clust):
             if num >= 10 and num_clust[i+1] < 10:
                 index = i
                 break
              
         out = torch.from_numpy(c[:,index])
+       # out = c 
         min_sim_init = min_sim_init[index]
+       # min_sim_init = min_sim_init[0]
+        
         
         print("min_sim_init: {}".format(min_sim_init))
         
@@ -1740,6 +1780,8 @@ class ConceptExpress:
             mask_pil.save(os.path.join(self.args.output_dir, 'attention/{}-step/mask_phase1_all{}.png'.format(global_step, i)))
             ##################
             
+            # filter
+           
             if score > 1.0:
                 mean = x[out==i].mean(0)
                 feat_max = x[out==i].max(0)[0]
@@ -1758,6 +1800,7 @@ class ConceptExpress:
                 norm = mean / mean.max()
                 norm = transform(norm.reshape(64,64))
                 norm.save(os.path.join(self.args.output_dir, 'attention/{}-step/self-attention-mean{}.png'.format(global_step, i)))
+                
         
         mask_mat = torch.stack(mask_candidate, dim=0).detach()
         feat_mat = torch.stack(feat_candidate, dim=0).detach()
@@ -1797,7 +1840,225 @@ class ConceptExpress:
             norm.save(os.path.join(self.args.output_dir,'attention/{}-step/final_mean{}.png'.format(global_step, i)))
         
         return mask_final, feat_final
+#########################################33 
+    
+    
+    ## mask_final
+    
+    def mask_feat_calculation(self, feat_map, eot_attn_mask, pil, global_step):
+    
+        mask_list_clustering, feat_list_clustering = self.cluster_attention(feat_map, eot_attn_mask, pil, global_step)
         
+  #      from sam2.build_sam import build_sam2
+   #     from sam2.sam2_image_predictor import SAM2ImagePredictor
+        
+        from segment_anything import sam_model_registry, SamPredictor
+       # from torchvision import transforms
+       # import matplotlib.pyplot as plt  
+        
+        transform = T.ToPILImage()
+        tsfm = transforms.Resize([256,256])
+        downsampling = transforms.Resize([64,64])
+        upsampling = transforms.Resize([512,512])
+        # mask = transform(eot_attn_mask)
+        # mask.save(os.path.join(self.args.output_dir, 'attention/{}-step/eot_attention.png'.format(global_step)))
+        
+        
+        eot_attn_mask = F.interpolate(
+            input=eot_attn_mask[None, None], size=(64, 64), mode='bilinear'
+        )
+        eot_attn_mask = eot_attn_mask.reshape(64,64)
+        
+        eot_attn_mask = (eot_attn_mask - eot_attn_mask.min()) / (eot_attn_mask.max() - eot_attn_mask.min())
+        
+        if not os.path.exists(os.path.join(self.args.output_dir, "attention/{}-step".format(global_step))):
+            os.makedirs(os.path.join(self.args.output_dir, "attention/{}-step".format(global_step)), exist_ok=True)
+        
+        # print(pil.dtype)
+        pil = transform(pil)
+        pil.save(os.path.join(self.args.output_dir, 'attention/{}-step/image.png'.format(global_step)))
+        image = np.array(pil.convert("RGB"))
+        
+        # image = np.array(tsfm(pil.convert("RGB")))
+
+        # checkpoint = "./checkpoints/sam2_hiera_large.pt"
+        # checkpoint = "./checkpoints/sam2_hiera_small.pt"
+        # model_cfg = "sam2_hiera_l.yaml"
+        # predictor = SAM2ImagePredictor(build_sam2(model_cfg, checkpoint))
+        
+        #image_input = Image.open("ckpts/Spectral_3_1/attention/0-step/image.png")
+        #image_np = np.array(tsfm(image_input))
+        
+        sam_checkpoint = "sam_vit_h_4b8939.pth"
+        model_type = "vit_h"
+        device = "cuda"
+        
+        sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+        sam.to(device=device)
+        predictor = SamPredictor(sam)
+        
+       # # =============
+       # B = 1   # ?
+       # # ============
+       # # 
+       # if B == 1:
+       #     # 
+       #     points, labels = show_pic_choose_points(image)
+       #     input_points, input_labels = np.array(points.copy()), np.array(labels.copy())  # input_points(n,2) input_labels(n,)
+       #     masks, scores, logits = predictor.predict(
+       #         point_coords=input_points,     #  [[x,y], [x,y],...] (n,2)
+       #         point_labels=input_labels,      #  [0, 1, ...] (n, )
+       #         multimask_output=multimask_output_bool,  # ?
+       #     )
+       #     # =============
+       #     for i, (mask, score) in enumerate(zip(masks, scores)):
+       #         plt.figure(figsize=(10, 10))
+       #         plt.imshow(image)
+       #         show_mask(mask, plt.gca())
+       #         show_points(input_points, input_labels, plt.gca())
+       #         plt.title(f"Mask {i + 1}, Score: {score:.3f}", fontsize=18)
+       #         plt.axis('off')
+       #         plt.show()
+        
+        masks = []
+        for mask_clustering_tensor in mask_list_clustering:
+            
+            mask_clustering = transform(mask_clustering_tensor)
+            mask_clustering_256 = tsfm(mask_clustering)
+            mask_clustering_256_np = np.array(mask_clustering_256)
+            mask_clustering_256_np = np.expand_dims(mask_clustering_256_np, axis=0)
+            mask_clustering_512 = upsampling(mask_clustering)
+            mask_clustering_512_np = np.array(mask_clustering_512)
+            print(sum(mask_clustering_256_np[0]))
+            
+            indices = np.argwhere(mask_clustering_512_np > 0)
+            indices = indices[:, ::-1]
+            k = 3
+
+            row_rand_array = np.arange(indices.shape[0])
+            np.random.shuffle(row_rand_array)
+            selected_indices = indices[row_rand_array[:k]]
+            
+            # input_points = selected_indices
+            print(selected_indices)
+            print(selected_indices.shape)
+            if len(masks) < 1:
+                input_points = np.array([[150,200],[150,300],[200,300]])
+            else:
+                input_points = np.array([[320,200],[330,300],[340,130]])
+            print(input_points)
+            print(input_points.shape)
+
+            input_labels = np.array([1] * k)
+            print(input_points)
+            
+            # with torch.inference_mode():
+            #     predictor.set_image(image)
+            #     #    mask_input = mask_clustering, 
+            #         mask_input = mask_clustering_256_np,
+            #         multimask_output = False
+            #      )
+            #     masks.append(mask[0].astype(int))
+            #     # masks.append(1.0 - mask[0])
+            
+            with torch.inference_mode():
+                predictor.set_image(image)
+                # masks.append(1.0 - mask[0])
+                mask, _, _ = predictor.predict(
+                point_coords=input_points,
+                point_labels=input_labels,
+                # box=input_box,
+                multimask_output=False,
+                )
+                masks.append(mask[0].astype(int))
+                # masks.append(1.0 - mask[0])
+            
+            def show_mask(mask, ax, random_color=False):
+                if random_color:
+                    color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+                else:
+                    color = np.array([30/255, 144/255, 255/255, 0.6])
+                h, w = mask.shape[-2:]
+                mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+                ax.imshow(mask_image)
+    
+            def show_points(coords, labels, ax, marker_size=375):
+                pos_points = coords[labels==1]
+                neg_points = coords[labels==0]
+                ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
+                ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white', linewidth=1.25) 
+
+            
+            if len(masks) > 1:
+                continue
+            import matplotlib.pyplot as plt
+            plt.imshow(image)
+            show_mask(mask[0], plt.gca())
+            show_points(input_points, input_labels, plt.gca())
+            plt.savefig("./masked_image_output.png")
+        
+        # # with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        # with torch.inference_mode():
+        #     predictor.set_image(image)
+        #     masks, scores, logits = predictor.predict(
+        #         multimask_output = True
+        #     )
+        
+        # sorted_ind = np.argsort(scores)[::-1]
+        # masks = masks[sorted_ind]
+        # scores = scores[sorted_ind]
+        # logits = logits[sorted_ind]
+        # masks = masks.astype(int)
+        
+        x = feat_map / feat_map.sum(-1, keepdim=True)
+        # print(x.shape)
+        
+        # plt.savefig()
+        
+        mask_final, feat_final = [], []
+        
+        
+        for i in range(len(masks)):
+                        
+            mask_i = torch.tensor(masks[i][::2, ::2]).to(self.accelerator.device)
+            mask_i = mask_i.to(torch.float32)
+            mask_i_64 = mask_i[::4, ::4]
+            
+            # mask_final.append(mask_i_64)
+            
+            # feat_i = feat_mat[mask_i > 0].mean(dim=0)
+            # feat_final.append(feat_i)
+            
+            print(mask_i_64)
+            print(sum(mask_i_64))
+            print(eot_attn_mask)
+            score = compute_score(mask_i_64, eot_attn_mask)
+
+            ######
+            
+            # filter
+            
+            print(score)
+            # if score > 1.0:
+            # if score > 0.7:
+            if True:
+                #mean = x[out==i].mean(0)
+                
+                mean = x[mask_i_64.reshape(-1) > 0, :].mean(0)
+            #    mean = x[mask_i_64 == 1].mean(0)
+               # feat_max = x[mask_i_64 == 1].max(0)[0]
+                mask_final.append(mask_i_64)
+                feat_final.append(mean)  
+                mask_i = transform(mask_i)
+                # mask_i.save(os.path.join(self.args.output_dir, 'attention/{}-step/mask_all{}.png'.format(global_step, i)))
+                mask_i.save(os.path.join(self.args.output_dir, 'attention/{}-step/sam_mask_all{}.png'.format(global_step, i)))
+                image_masked = self.vis_masked_image(pil, mask_i)
+                # image_masked.save(os.path.join(self.args.output_dir,'attention/{}-step/final_masked{}.png'.format(global_step, i)))
+                image_masked.save(os.path.join(self.args.output_dir,'attention/{}-step/sam_final_masked{}.png'.format(global_step, i)))
+    
+        return mask_final, feat_final
+    ##########################################################
+    
     @torch.no_grad()
     def perform_full_inference(self, path, guidance_scale=7.5):
         self.unet.eval()
