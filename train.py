@@ -1508,6 +1508,32 @@ class ConceptExpress:
                         learned_embeds_dict = save_progress(self.text_encoder, placeholder_token, placeholder_token_id, self.accelerator, save_path)
                         test_generation(self.args, placeholder_token, learned_embeds_dict, 'merging', self.token_manager.split_state)
                 
+                # if global_step < self.args.merge_step and global_step % 10 == 0:
+                if global_step < self.args.merge_step and global_step == 90:
+                
+                    num_tokens = self.token_manager.get_token_num()
+                    embed_add = self.accelerator.unwrap_model(
+                        self.text_encoder
+                        ).get_input_embeddings().weight.data[-self.args.num_of_assets:].detach()
+                    
+                    for j in range(self.args.num_split_tokens):
+                        new_embed = 0.
+                        for i in range(num_tokens):
+                            new_embed += embed_add[i + j * num_tokens]
+                        
+                        original_embed = self.accelerator.unwrap_model(
+                            self.text_encoder
+                        ).get_input_embeddings().weight.data[
+                            -self.args.num_of_assets+j
+                        ]
+                        
+                        self.accelerator.unwrap_model(
+                            self.text_encoder
+                        ).get_input_embeddings().weight.data[
+                            -self.args.num_of_assets+j
+                        ] = (original_embed + new_embed) / (self.args.num_split_tokens + 1)
+                        
+                
                 self.accelerator.wait_for_everyone()
                 prompt_ids_list, tokens_to_use_list, masks_to_use_list, feats_to_use_list, token_ids_list = self.token_manager.loader(batch["flip"], bsz)
                 
