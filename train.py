@@ -176,7 +176,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--instance_data_dir_combined",
         type=str,
-        default=None,
+        default="uce_images/78_88",
         required=True,
         help="A folder containing the training data of instance images.",
     )
@@ -641,7 +641,20 @@ class TokenManager():
         masks_to_use = [self.mask_list[tkn_i] for tkn_i in tokens_ids_to_use]
         feats_to_use = [self.feat_list[tkn_i] for tkn_i in tokens_ids_to_use]
         
-        token_ids = torch.tensor(tokens_ids_to_use)
+        #token_ids = torch.tensor(tokens_ids_to_use)
+        if self.split_state:
+            num_split_tokens = self.num_split_tokens
+        else:
+            num_split_tokens = 1
+        
+        tokens_ids_global = []
+        for tokens_id in tokens_ids_to_use:
+            if tokens_id < len(self.ph_tokens_used) - num_split_tokens:
+                tokens_ids_global.append(tokens_id)
+            else:
+                tokens_ids_global.append(tokens_id + len(self.all_ph_tokens) - len(self.ph_tokens_used) - self.num_split_tokens + num_split_tokens)
+
+        token_ids = torch.tensor(tokens_ids_global)
         
         if flip[0]:
             masks_to_use = self.flip_mask(masks_to_use)
@@ -662,17 +675,26 @@ class TokenManager():
     
     def split_tokens(self):
         if not self.split_state:
-            self.ph_tokens_used = self.all_ph_tokens[:self.num_tokens * self.num_split_tokens]
-            self.mask_list = self.mask_list  * self.num_split_tokens
-            self.feat_list = self.feat_list * self.num_split_tokens
+            # self.ph_tokens_used = self.all_ph_tokens[:self.num_tokens * self.num_split_tokens]
+            self.ph_tokens_used = self.all_ph_tokens[:self.num_tokens * self.num_split_tokens] + self.all_ph_tokens[-self.num_split_tokens:]
+            #self.mask_list = self.mask_list  * self.num_split_tokens
+            #self.feat_list = self.feat_list * self.num_split_tokens
+            self.mask_list = self.mask_list * self.num_split_tokens + [torch.full_like(self.mask_list[0], 1)] * self.num_split_tokens
+            self.feat_list = self.feat_list * self.num_split_tokens + [torch.full_like(self.feat_list[0], 1)] * self.num_split_tokens
             self.split_state = True
+            
             
     def merge_tokens(self):
         if self.split_state:
-            self.ph_tokens_used = self.all_ph_tokens[:self.num_tokens]
-            self.mask_list = self.mask_list[:self.num_tokens]
-            self.feat_list = self.feat_list[:self.num_tokens]
+            # self.ph_tokens_used = self.all_ph_tokens[:self.num_tokens]
+            self.ph_tokens_used = self.all_ph_tokens[:self.num_tokens] + [self.all_ph_tokens[-self.num_split_tokens]]
+            # self.mask_list = self.mask_list[:self.num_tokens]
+            # self.feat_list = self.feat_list[:self.num_tokens]
+            # self.split_state = False
+            self.mask_list = self.mask_list[:self.num_tokens] + [self.mask_list[-self.num_split_tokens]] + [torch.full_like(self.mask_list[0], 1)] * (self.num_tokens + 1)
+            self.feat_list = self.feat_list[:self.num_tokens] + [self.feat_list[-self.num_split_tokens]] + [torch.full_like(self.mask_list[0], 1)] * (self.num_tokens + 1)
             self.split_state = False
+    
     
     def get_token_num(self):
         return self.num_tokens
@@ -693,13 +715,40 @@ class TokenManager():
             token_ids_list.append(token_ids)
         
         if not self.split_state:
+            # v0 and v1
+            prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = self.return_single_token([0, 1], flip, bsz)
+            prompt_ids_list.append(prompt_ids)
+            tokens_to_use_list.append(tokens_to_use)
+            # masks_to_use_list.append(masks_to_use)
+            feats_to_use_list.append(feats_to_use)
+            token_ids_list.append(token_ids)
+            
+            instance_mask_path_combined = os.path.join("uce_images/78_88", "mask_combined.jpg")
+            downsampling = transforms.Resize([64,64])
+            mask_combined = Image.open(instance_mask_path_combined)
+            mask_combined = downsampling(mask_combined)
+            masks_to_use_combined = transforms.ToTensor()(mask_combined).to(masks_to_use.device)
+            # print(masks_to_use_combined.shape)
+            masks_to_use_list.append(masks_to_use_combined)
+
+            # vi and v*
+            for j in range(self.num_tokens, len(self.ph_tokens_used)):
+                for i in range(self.num_tokens):
+                    prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = self.return_single_token([i, j], flip, bsz)
+                    prompt_ids_list.append(prompt_ids)
+                    tokens_to_use_list.append(tokens_to_use)
+                    masks_to_use_list.append(masks_to_use)
+                    feats_to_use_list.append(feats_to_use)
+                    token_ids_list.append(token_ids)
+
+            # v0 and v1 and v*
             prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = self.return_single_token(list(range(len(self.ph_tokens_used))), flip, bsz)
             prompt_ids_list.append(prompt_ids)
             tokens_to_use_list.append(tokens_to_use)
             masks_to_use_list.append(masks_to_use)
             feats_to_use_list.append(feats_to_use)
             token_ids_list.append(token_ids)
-        
+
         return prompt_ids_list, tokens_to_use_list, masks_to_use_list, feats_to_use_list, token_ids_list
         
 class DreamBoothDataset(Dataset):
@@ -796,7 +845,7 @@ def collate_fn(examples):
     pixel_values_2 = torch.stack(pixel_values_2)
     pixel_values_2 = pixel_values_2.to(memory_format=torch.contiguous_format).float()
     pixel_values_combined = torch.stack(pixel_values_combined)
-    pixel_values_combined = pixel_values_2.to(memory_format=torch.contiguous_format).float()
+    pixel_values_combined = pixel_values_combined.to(memory_format=torch.contiguous_format).float()
 
     # batch = {
     #     "pixel_values": pixel_values,
@@ -936,6 +985,12 @@ class ConceptExpress:
             self.args.placeholder_token.replace(">", f"{idx}>")
             for idx in range(self.args.num_of_assets)
         ]
+        # self.placeholder_tokens.append(self.args.placeholder_token.replace(">", f"*>"))
+        # self.args.num_of_assets += 1
+        for i in range(self.args.num_split_tokens):
+            self.placeholder_tokens.append(self.args.placeholder_token.replace(">", f"*{chr(97+i)}>"))
+        self.args.num_of_assets += self.args.num_split_tokens
+       
         num_added_tokens = self.tokenizer.add_tokens(self.placeholder_tokens)
         assert num_added_tokens == self.args.num_of_assets
         self.placeholder_token_ids = self.tokenizer.convert_tokens_to_ids(
@@ -1396,11 +1451,13 @@ class ConceptExpress:
                         
                         mask_list_2, feat_list_2 = self.get_self_attention(eot_attn_mask_2, batch["pixel_values_2"][0], global_step, 2)
                         
-                        print("Please refer to image 1 masked outputs")
-                        concept_index_1 = int(input("And select a concept in image 1: ")) - 1
+                        # print("Please refer to image 1 masked outputs")
+                        # concept_index_1 = int(input("And select a concept in image 1: ")) - 1
+                        concept_index_1 = 0
                         
-                        print("Please refer to image 2 masked outputs")
-                        concept_index_2 = int(input("And select a concept in image 2: ")) - 1
+                        # print("Please refer to image 2 masked outputs")
+                        # concept_index_2 = int(input("And select a concept in image 2: ")) - 1
+                        concept_index_2 = 0
                         
                         mask_list = [mask_list_1[concept_index_1]] + [mask_list_2[concept_index_2]] # "+" for mask1 and mask2 combine to the mask_final
         
@@ -1433,6 +1490,16 @@ class ConceptExpress:
                         ).get_input_embeddings().weight.data[
                             -self.args.num_of_assets+i
                         ] = new_embed / self.args.num_split_tokens
+                    # as for v*
+                    new_embed = 0.
+                    for i in range(self.args.num_split_tokens):
+                        new_embed += embed_add[-self.args.num_split_tokens+i]                        
+                    # merge the embeddings for each concept by taking average of the split embeddings
+                    self.accelerator.unwrap_model(
+                        self.text_encoder
+                    ).get_input_embeddings().weight.data[
+                        -self.args.num_split_tokens
+                    ] = new_embed / self.args.num_split_tokens
                     
                     if self.accelerator.is_main_process:
                         save_path = os.path.join(self.args.output_dir, f"learned_embeds-merging-step.bin")
@@ -1478,6 +1545,9 @@ class ConceptExpress:
                     continue
 
                 with self.accelerator.accumulate(self.unet):
+                    cross_attn_flag = []
+                    asset_attn_mask_v0 = None
+                    asset_attn_mask_v1 = None
                     for list_idx in range(len(prompt_ids_list)):
                         prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = \
                             prompt_ids_list[list_idx], tokens_to_use_list[list_idx],\
@@ -1486,21 +1556,32 @@ class ConceptExpress:
                         # latents = self.vae.encode(
                         #     batch["pixel_values"].to(dtype=self.weight_dtype)
                         # ).latent_dist.sample()
-                        # TODO
                         
+                        # TODO judge the image index
                         if self.token_manager.split_state:
-                            if list_idx % self.token_manager.get_token_num() == 0:
-                                image_index = 1
+                            if list_idx < self.token_manager.get_token_num() * self.args.num_split_tokens:             
+                                if list_idx % self.token_manager.get_token_num() == 0:
+                                    image_index = 1
+                                else:
+                                    image_index = 2
                             else:
-                                image_index = 2
+                                if global_step % 2 == 0:
+                                    image_index = 1
+                                else:
+                                    image_index = 2
                         else:
-                            if list_idx == 0:
+                            if list_idx == 0: # v1
                                 image_index = 1
-                            if list_idx == 1:
+                            elif list_idx == 1: # v2
                                 image_index = 2
-                            else: # TODO how to handle this case
+                            elif list_idx == 2: # v1 and v2
+                                # if global_step % 2 == 0:
+                                #     image_index = 1
+                                # else:
+                                #     image_index = 2
                                 image_index = 3
-                                break
+                            else: # v1 and v*, v2 and v*, v1 and v2 and v*
+                                image_index = 3
                         
                         if image_index == 1:
                             latents = self.vae.encode(
@@ -1509,6 +1590,10 @@ class ConceptExpress:
                         elif image_index == 2:
                             latents = self.vae.encode(
                                 batch["pixel_values_2"].to(dtype=self.weight_dtype)
+                            ).latent_dist.sample()
+                        elif image_index == 3:
+                            latents = self.vae.encode(
+                                batch["pixel_values_combined"].to(dtype=self.weight_dtype)
                             ).latent_dist.sample()
                         
                         latents = latents * 0.18215
@@ -1568,9 +1653,14 @@ class ConceptExpress:
                                 pil = (batch["pixel_values_1"][0] * 0.5 + 0.5)
                                 pil = T.ToPILImage()(pil)
                                 image_masked_save = self.vis_masked_image(pil, max_mask_np)
-                                image_masked_save.save(f"image_{image_index:05}.jpg")
+                                image_masked_save.save(f"image_{image_index:02}_masked.jpg")
                             elif image_index == 2:
                                 pil = (batch["pixel_values_2"][0] * 0.5 + 0.5)
+                                pil = T.ToPILImage()(pil)
+                                image_masked_save = self.vis_masked_image(pil, max_mask_np)
+                                image_masked_save.save(f"image_{image_index:02}_masked.jpg")
+                            elif image_index == 3:
+                                pil = (batch["pixel_values_combined"][0] * 0.5 + 0.5)
                                 pil = T.ToPILImage()(pil)
                                 image_masked_save = self.vis_masked_image(pil, max_mask_np)
                                 image_masked_save.save(f"image_{image_index:02}_masked.jpg")
@@ -1605,15 +1695,21 @@ class ConceptExpress:
                                 curr_placeholder_token_id = self.placeholder_token_ids[
                                     token_ids[mask_id]
                                 ]
+                                
+                                # print(prompt_ids[batch_idx])
+                                # print(curr_placeholder_token_id)
 
                                 asset_idx = (
                                     (
                                         prompt_ids[batch_idx]
                                         == curr_placeholder_token_id
+                                        
                                     )
                                     .nonzero()
                                     .item()
                                 )
+                                
+                               
                                 asset_attn_mask = agg_attn[..., asset_idx]
                                 feat_target = GT_feats[mask_id, 0].detach()
                                 
@@ -1652,7 +1748,7 @@ class ConceptExpress:
                         if self.token_manager.split_state:
                             converted_ids = self.tokenizer.encode([i[0] for i in tokens_to_use_list], 
                                                                   add_special_tokens=False, return_tensors='pt')
-                            
+                            converted_ids = converted_ids[:, :self.token_manager.get_token_num() * self.args.num_split_tokens]
                             sample_embeddings = self.accelerator.unwrap_model(
                                         self.text_encoder
                                     ).get_input_embeddings()(converted_ids.to(self.text_encoder.device))[0]
@@ -1667,6 +1763,39 @@ class ConceptExpress:
                             loss_con = self.contrastive_loss(sample_embeddings_normalized, labels=label)
                             
                             loss += loss_con * self.args.weight_contrast
+                       
+					            	#######################################
+                        ### TODO the cross attention module ###
+                        #######################################
+                        attn_loss_star = 0.
+                        if not self.token_manager.split_state:
+                            # v0 and v1
+                            if list_idx == self.token_manager.get_token_num() + 1:
+                                # cross attn for V0
+                                asset_idx_v0 = 4
+                                asset_attn_mask_v0 = agg_attn[..., asset_idx_v0]
+                                asset_attn_mask_v0 = asset_attn_mask_v0.detach().clone()
+                                # cross attn for V1
+                                asset_idx_v1 = 6
+                                asset_attn_mask_v1 = agg_attn[..., asset_idx_v1]
+                                asset_attn_mask_v1 = asset_attn_mask_v1.detach().clone()
+                            # v0 and v*
+                            asset_idx_v_star = 6
+                            asset_attn_mask_star = agg_attn[..., asset_idx_v_star]
+                            asset_attn_mask_star = asset_attn_mask_star.clone()
+                            if list_idx == self.token_manager.get_token_num() + 2:
+                                attn_loss_star += wasser_loss(
+                                    asset_attn_mask_star.float(),
+                                    asset_attn_mask_v1.float(),
+                                )
+                            # v1 and v*
+                            elif list_idx == self.token_manager.get_token_num() + 2 + 1:
+                                attn_loss_star += wasser_loss(
+                                    asset_attn_mask_star.float(),
+                                    asset_attn_mask_v0.float(),
+                                )
+                            loss += attn_loss_star
+
 
                         self.accelerator.backward(loss)
 
@@ -1698,6 +1827,176 @@ class ConceptExpress:
                                 ] = orig_embeds_params[
                                     : -self.args.num_of_assets
                                 ]
+
+                    if (global_step % 10) % 2 == 1:# and self.token_manager.split_state:
+                        # only traverse v_i's
+
+                        if self.token_manager.split_state:
+                            # len(prompt_ids_list) = 15
+                            id_start = 1
+                            id_end = self.args.num_split_tokens
+                        else:
+                            # Added "v1 and v2 and v*" prompt, (the last), so need to index one more
+                            ### without cross attn, prompt_ids_list has length 4
+                            # len(prompt_ids_list) = 4
+                            # TODO: without cross attn
+                            # id_start = 2
+                            # id_end = 2
+                            #TODO: with cross attn
+                            id_start = 1+2+1
+                            id_end = 1+2+1
+                        for list_idx in range(len(prompt_ids_list)-id_end):
+                            prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = \
+                            prompt_ids_list[list_idx], tokens_to_use_list[list_idx],\
+                                masks_to_use_list[list_idx], feats_to_use_list[list_idx], token_ids_list[list_idx]
+
+                            prompt_ids_star, tokens_to_use_star, masks_to_use_star, feats_to_use_star, token_ids_star = \
+                                prompt_ids_list[-random.randint(id_start, id_end)], \
+                                tokens_to_use_list[-random.randint(id_start, id_end)], \
+                                masks_to_use_list[-random.randint(id_start, id_end)], \
+                                feats_to_use_list[-random.randint(id_start, id_end)], \
+                                token_ids_list[-random.randint(id_start, id_end)]
+                            
+                            if self.token_manager.split_state:
+                                if list_idx % self.token_manager.get_token_num() == 0:
+                                    image_index = 1
+                                else:
+                                    image_index = 2
+                            else:
+                                if list_idx == 0:
+                                    image_index = 1
+                                elif list_idx == 1:
+                                    image_index = 2
+
+                            # Convert images to latent space
+                            # latents = self.vae.encode(
+                            #     batch["pixel_values"].to(dtype=self.weight_dtype)
+                            # ).latent_dist.sample()
+                            if image_index == 1:
+                                latents = self.vae.encode(
+                                    batch["pixel_values_1"].to(dtype=self.weight_dtype)
+                                ).latent_dist.sample() 
+                            elif image_index == 2:
+                                latents = self.vae.encode(
+                                    batch["pixel_values_2"].to(dtype=self.weight_dtype)
+                                ).latent_dist.sample()
+                            latents = latents * 0.18215
+
+                            # Sample noise that we'll add to the latents
+                            noise = torch.randn_like(latents)
+                            bsz = latents.shape[0]
+                            # Sample a random timestep for each image
+                            timesteps = torch.randint(
+                                0,
+                                self.noise_scheduler.config.num_train_timesteps,
+                                (bsz,),
+                                device=latents.device,
+                            )
+                            timesteps = timesteps.long()
+
+                            # Add noise to the latents according to the noise magnitude at each timestep
+                            # (this is the forward diffusion process)
+                            noisy_latents = self.noise_scheduler.add_noise(
+                                latents, noise, timesteps
+                            )
+                            
+                            self.controller.set_update_attention(False)
+                            # Since we only train v*, we don't do back propagation for v_i's
+                            with torch.no_grad():
+                                # Get the text embedding for conditioning
+                                prompt_ids = prompt_ids.to(latents.device)
+                                encoder_hidden_states = self.text_encoder(prompt_ids)[0]
+                                # Predict the noise residual
+                                model_pred = self.unet(
+                                    noisy_latents, timesteps, encoder_hidden_states
+                                ).sample
+                                model_pred_detached = model_pred.detach()
+                                del model_pred, encoder_hidden_states
+                                # empty_cache()
+                                torch.cuda.empty_cache()
+                                
+                            self.controller.set_update_attention(True)
+
+                            # Get the text embedding for conditioning
+                            prompt_ids_star = prompt_ids_star.to(latents.device)
+                            encoder_hidden_states_star = self.text_encoder(prompt_ids_star)[0]
+                            # Predict the noise residual
+                            model_pred_star = self.unet(
+                                noisy_latents, timesteps, encoder_hidden_states_star
+                            ).sample
+                            del noisy_latents, encoder_hidden_states_star
+                            # empty_cache()
+                            torch.cuda.empty_cache()
+                            
+                            # # Get the target for loss depending on the prediction type
+                            # if self.noise_scheduler.config.prediction_type == "epsilon":
+                            #     target = noise
+                            # elif self.noise_scheduler.config.prediction_type == "v_prediction":
+                            #     target = self.noise_scheduler.get_velocity(
+                            #         latents, noise, timesteps
+                            #     )
+                            # else:
+                            #     raise ValueError(
+                            #         f"Unknown prediction type {self.noise_scheduler.config.prediction_type}"
+                            #     )
+
+                            _, model_pred_detached = torch.chunk(model_pred_detached, 2, dim=0)
+                            # _, target = torch.chunk(target, 2, dim=0)
+                            _, model_pred_star = torch.chunk(model_pred_star, 2, dim=0)
+                            
+                            if self.args.apply_masked_loss:
+                                max_mask = torch.max(
+                                    masks_to_use, dim=0, keepdim=True
+                                ).values.unsqueeze(1)
+                            
+                                max_mask_np = T.ToPILImage()(max_mask.reshape(64,64))
+                                # pil = (batch["pixel_values"][0] * 0.5 + 0.5) 
+                                if image_index == 1:
+                                    pil = (batch["pixel_values_1"][0] * 0.5 + 0.5) 
+                                elif image_index == 2:
+                                    pil = (batch["pixel_values_2"][0] * 0.5 + 0.5) 
+                                pil = T.ToPILImage()(pil)
+                                image_masked_save = self.vis_masked_image(pil, max_mask_np)
+
+                                model_pred_detached = model_pred_detached * max_mask
+                                # target = target * max_mask
+                                model_pred_star = model_pred_star * max_mask
+                            
+                            # loss between v* and v_i's
+                            loss = F.mse_loss(
+                                model_pred_detached.float(), model_pred_star.float(), reduction="mean"
+                            )
+
+                            self.accelerator.backward(loss)
+                            
+                            # No need to keep the attention store
+                            self.controller.attention_store = {}
+                            self.controller.cur_step = 0
+
+                            if self.accelerator.sync_gradients:
+                                params_to_clip = (
+                                    itertools.chain(
+                                        self.unet.parameters(), self.text_encoder.parameters()
+                                    )
+                                    if self.args.train_text_encoder
+                                    else self.unet.parameters()
+                                )
+                                self.accelerator.clip_grad_norm_(
+                                    params_to_clip, self.args.max_grad_norm
+                                )
+                            optimizer.step()
+                            lr_scheduler.step()
+                            optimizer.zero_grad(set_to_none=self.args.set_grads_to_none)
+                        
+                            if global_step < self.args.phase1_train_steps:
+                                with torch.no_grad():
+                                    self.accelerator.unwrap_model(
+                                        self.text_encoder
+                                    ).get_input_embeddings().weight[
+                                        : -self.args.num_of_assets
+                                    ] = orig_embeds_params[
+                                        : -self.args.num_of_assets
+                                    ]
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if self.accelerator.sync_gradients:
@@ -2145,7 +2444,8 @@ class ConceptExpress:
        #         plt.show()
        
         k = 3
-        user_define_input = True
+        user_define_input = False
+       
         
         plt.cla()
         plt.imshow(image)
